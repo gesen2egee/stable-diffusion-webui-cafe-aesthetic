@@ -101,37 +101,62 @@ def progress_str(progress):
     return int(progress * 1000) / 10
 
 
-def copy_or_move_files(img_path: Path, to: Path, copy, together):
-    img_name = img_path.stem  # hoge.jpg
-    if together:
-        for p in img_path.parent.glob(f"{img_name}.*"):
+def copy_or_move_files(img_path: Path, to: Path, copy: bool, together: bool):
+    def handle_file(file_path: Path, destination: Path):
+        # 檢查目的地是否有同名檔案
+        if destination.exists():
+            print(f"File exists, skipping: {file_path.name}".encode("utf-8"))
+            return
+
+        try:
             if copy:
-                shutil.copy2(p, to / p.name)
+                shutil.copy2(file_path, destination)
+                print(f"Copied: {file_path} to {destination}".encode("utf-8"))
             else:
-                if os.path.exists(p):
-                    p.rename(to / p.name)
+                if file_path.exists():
+                    file_path.rename(destination)
+                    print(f"Moved: {file_path} to {destination}".encode("utf-8"))
                 else:
-                    print(f"Not found: {p}".encode("utf-8"))
+                    print(f"Not found: {file_path}".encode("utf-8"))
+        except PermissionError:
+            # 如果檔案被其他程式使用，捕獲權限錯誤
+            print(f"Permission denied, skipping: {file_path.name}".encode("utf-8"))
+        except Exception as e:
+            # 處理其他可能導致中斷的異常情況
+            print(f"Error occurred with {file_path.name}: {e}".encode("utf-8"))
+
+    img_name = img_path.stem  # 檔案名稱，不包含副檔名
+    if together:
+        # 處理所有同名檔案
+        for p in img_path.parent.glob(f"{img_name}.*"):
+            handle_file(p, to / p.name)
     else:
-        if copy:
-            shutil.copy2(img_path, to / img_path.name)
-        else:
-            img_path.rename(to / img_path.name)
+        # 只處理單個檔案
+        handle_file(img_path, to / img_path.name)
 
+def resize_image(img_path, max_size=640):
+    img = Image.open(img_path)
+    width, height = img.size
+    if max(width, height) > max_size:
+        ratio = max_size / max(width, height)
+        new_width = int(width * ratio)
+        new_height = int(height * ratio)
+        img = img.resize((new_width, new_height), Image.ANTIALIAS)
+    return img
 
-def batch_classify(
-    input_dir, output_dir, classify_type, output_style, together, basis, threshold
-):
-    print("Batch classifying started")
+def batch_classify(input_dir, output_dir, classify_type, output_style, together, basis, threshold):
+    print("Batch classifying started...")
     try:
+        # Convert string paths to Path objects
         input_dir = Path(input_dir)
         output_dir = Path(output_dir)
-        image_paths = [
-            p
-            for p in input_dir.iterdir()
-            if (p.is_file and p.suffix.lower() in [".png", ".jpg", ".jpeg", ".webp"])
-        ]
-
+        
+        # Use rglob to iterate through current directory and sub-directories
+        image_paths = []
+        for pattern in ["*", "*/*"]:
+            image_paths.extend(input_dir.glob(pattern))
+        image_paths = [p for p in image_paths if p.is_file() and p.suffix.lower() in [".png", ".jpg", ".jpeg", ".webp"]]
+        
         print(f"Found {len(image_paths)} images")
 
         classifyer = None
@@ -144,14 +169,16 @@ def batch_classify(
 
         folders = classify_outputs_folders(classify_type)
 
-        for f in folders:
-            os.makedirs(output_dir / f, exist_ok=True)
+        for f in image_paths:
+            relative_path = f.relative_to(input_dir)
+            output_subdir = output_dir / relative_path.parent
+            os.makedirs(output_subdir, exist_ok=True)
 
         for i, f in enumerate(image_paths):
             if f.is_dir():
                 continue
 
-            img = Image.open(f)
+            img = resize_image(f, max_size=640)
             result = classifyer(img)
 
             max_score = 0
@@ -166,12 +193,34 @@ def batch_classify(
                     if score > threshold and score > max_score:
                         max_score = score
                         max_label = label
-
-            if max_label is None:
+        
+            # For Waifu, create a tag file with different labels based on the score
+            if classify_type == "Waifu":
+                # Extract the score for the 'waifu' label
+                waifu_score = result.get("waifu", 0)                
+                waifu_label = ""
+                if waifu_score <= 0.4:
+                    waifu_label = "not_waifu"                 
+                else:
+                    waifu_label = "waifu"
+                if waifu_label == "not_waifu":
+                    os.makedirs(output_subdir / waifu_label, exist_ok=True)
+                    print(
+                        f"Classified {f.name} as not_waifu with {progress_str(max_score)}% confidence".encode("utf-8")
+                    )            
+                    copy_or_move_files(
+                        f, output_subdir / waifu_label, output_style == "Copy", together
+                    )                
+                continue
+            if max_label is None or max_label.lower() in ['anime'] or max_label.lower() in ['aesthetic']:
+                print(
+                    f"Classified {f.name} as {max_label} with {progress_str(max_score)}% confidence".encode("utf-8")
+                )                
                 continue
 
+            os.makedirs(output_subdir / max_label, exist_ok=True)
             copy_or_move_files(
-                f, output_dir / max_label, output_style == "Copy", together
+                f, output_subdir / max_label, output_style == "Copy", together
             )
 
             print(
